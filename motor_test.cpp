@@ -1,7 +1,8 @@
 // === Pin Definitions ===
-const int MOTOR_ENA[4] = {13, 21, 4, 27};      // PWM pins for Motor 1–4
-const int MOTOR_IN1[4] = {23, 19, 16, 14};     // IN1/IN3 for Motor 1–4
-const int MOTOR_IN2[4] = {22, 18, 17,  5};     // IN2/IN4 for Motor 1–4
+//                        LF  LB  RF  RB
+const int MOTOR_ENA[4] = {27, 14, 23, 22};      // PWM pins for Motor 1–4
+const int MOTOR_IN1[4] = {12, 15,  4, 18};     // IN1/IN3 for Motor 1–4
+const int MOTOR_IN2[4] = {13, 21,  5, 19};     // IN2/IN4 for Motor 1–4
 
 // === PWM Setup ===
 const int PWM_FREQ = 1000;   // 1 kHz
