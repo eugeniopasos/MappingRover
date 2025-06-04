@@ -1,8 +1,9 @@
 /*****************************************************************
  *  ESP-NOW Station  (RTOS version) → Serial to PC 
- *     • receives LiDAR / encoder frames from rover data transmitter
- *     • dedicated task “SerialTask” drains USB keyboard and forwards
- *       w / a / s / d / x commands (max 3 repeats) via ESP-NOW
+ * 
+ *     • Receives LiDAR / encoder frames from rover data transmitter
+ *     • Dedicated task “SerialTask” drains incomming key commands 
+ *       and target control angles
  * 
  * Platform:   ESP32-S3 (Arduino-ESP32 core ≥ 3.0.0)
  *****************************************************************/
@@ -13,14 +14,25 @@
 /* ---------- Message-type IDs (must match rover) ------------- */
 #define MSG_TYPE_LIDAR_POINTS  0x10
 #define MSG_TYPE_ENCODERS      0x11
-#define MSG_TYPE_CONTROL       0x12       
+#define MSG_TYPE_COMMAND       0x12
+#define MSG_TYPE_CONTROL       0x13
 
 /* ---------- Types used by incoming LiDAR packet -------------- */
 struct __attribute__((packed)) Point {
-  uint8_t  angle;          // 0-255 ⇒ 360 ° * angle / 256
+  float  angle;          
   uint16_t dist_q4;        // 0.25 mm units
   uint8_t  qual;           // quality 0-63
 };
+
+/* ---------- Encoder Packet -------------- */
+#pragma pack(push,1)                 // no padding bytes
+struct EncoderYawPacket {
+    uint8_t  type;        // MSG_TYPE_ENCODERS
+    int16_t  counts[4];   // wheel encoder values
+    float    yaw;         // most‑recent yaw from serial
+};
+#pragma pack(pop)
+
 
 /* ---------- Peer (rover) MAC address ------------------------ */
 static const uint8_t PEER_MAC[6] = { 0x5C,0x01,0x3B,0x96,0x2E,0x24 };
@@ -29,13 +41,8 @@ static const uint8_t PEER_MAC[6] = { 0x5C,0x01,0x3B,0x96,0x2E,0x24 };
 void        setupEspNow();
 void        onReceive(const uint8_t*, const uint8_t*, int);
 void        onSent   (const uint8_t*, esp_now_send_status_t);
-esp_err_t   sendControl(char cmd);
+esp_err_t sendData(uint8_t msgType, const void* data, size_t len);
 void        SerialTask(void* arg);     // *** new ***
-
-/* ---------- Command-repeat limiter -------------------------- */
-constexpr uint8_t  MAX_REPEATS  = 3;
-static    char     last_cmd     = '\0';
-static    uint8_t  repeat_count = 0;
 
 /* ---------- ESP-NOW state flag (shared with ISR) ------------ */
 volatile bool espnow_busy = false;
@@ -43,7 +50,7 @@ volatile bool espnow_busy = false;
 /* =====================  SETUP  ============================== */
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(921600);
   Serial.setRxBufferSize(1024);        // room for key-mash bursts
   setupEspNow();
 
@@ -59,54 +66,60 @@ void setup()
   );
 }
 
-/* =====================  LOOP  =============================== *
- * Loop is now free; keep it minimal so SerialTask gets plenty
- * of CPU time.  You can do other work here later.              */
+/* =====================  LOOP  =============================== */
 void loop()
 {
   vTaskDelay(10);   // yield; nothing needed here for now
 }
 
 /* ===================  RTOS TASK  ============================ */
-void SerialTask(void*)
-{
-  for (;;)
-  {
-    /* drain ALL pending bytes each pass */
-    while (Serial.available())
-    {
-      char c = tolower(Serial.read());
-      if (!(c=='w'||c=='a'||c=='s'||c=='d'||c=='x'||
-            c =='r'||c=='f'||c=='u'||c=='i'||c=='o'||
-            c=='j'||c=='k'||c=='l'||c=='n'||c==',')) continue;
-
-      esp_err_t err = sendControl(c);
-
-      /* repeat-limiter */
-      // if (c != last_cmd) { last_cmd = c; repeat_count = 0; }
-
-      // if (repeat_count < MAX_REPEATS)
-      // {
-      // if (sendControl(c) == ESP_OK)
-      //   ++repeat_count;           // count only if radio queued it
-      //}
+void SerialTask(void*) {
+  for (;;) {
+    // do we have at least 1 byte (the type)?
+    if (Serial.available() < 1) {
+      vTaskDelay(1);
+      continue;
     }
-    vTaskDelay(1);                  // give up timeslice (≈1 ms)
+
+    uint8_t msgType = Serial.read();  // consume the type byte
+
+    if (msgType == MSG_TYPE_COMMAND) {
+      // wait until the single command byte arrives
+      while (Serial.available() < 1) { vTaskDelay(1); }
+
+      char cmd = Serial.read();        // command character
+      sendData(MSG_TYPE_COMMAND, &cmd, 1);
+    } 
+
+    else if (msgType == MSG_TYPE_CONTROL) {
+      // wait for the full 4-byte float
+      while (Serial.available() < sizeof(float)) { vTaskDelay(1); }
+
+      float val;
+      Serial.readBytes((char*)&val, sizeof(val));
+      sendData(MSG_TYPE_CONTROL, &val, sizeof(val));
+      //Serial.println(val);
+
+    } 
+    else {continue;}
   }
 }
 
 /* --------------- send one control byte via ESP-NOW ---------- */
-esp_err_t sendControl(char cmd)
-{
+esp_err_t sendData(uint8_t msgType, const void* data, size_t len) {
+
   if (espnow_busy) return ESP_ERR_INVALID_STATE;
 
-  uint8_t payload[2] = { MSG_TYPE_CONTROL,
-                         static_cast<uint8_t>(cmd) };
+  uint8_t payload[1 + len];
+  payload[0] = msgType;
+  memcpy(payload + 1, data, len);
+
   espnow_busy = true;
+
   return esp_now_send(PEER_MAC, payload, sizeof(payload));
 }
 
-/* =================  ESP-NOW plumbing ======================== */
+/* =================  ESP-NOW ======================== */
 void setupEspNow()
 {
   WiFi.mode(WIFI_STA);
@@ -146,14 +159,21 @@ void onReceive(const uint8_t*, const uint8_t* data, int len)
     const Point* pts = reinterpret_cast<const Point*>(&data[2]);
     for (uint8_t i = 0; i < count; ++i) {
       float dist_mm = pts[i].dist_q4 * 0.25f;
-      float deg     = pts[i].angle * 360.0f / 256.0f;
-      Serial.printf("LIDAR  %.1f°  %.1f mm  q=%u\n",
-                    deg, dist_mm, pts[i].qual);
+      float deg     = pts[i].angle; //* 360.0f / 256.0f;
+      Serial.printf("L,%.1f,%.1f,%u\n", deg, dist_mm, pts[i].qual);
+      // Serial.printf("LIDAR  %.1f°  %.1f mm  q=%u\n",
+      //               deg, dist_mm, pts[i].qual);
     }
   }
-  else if (type == MSG_TYPE_ENCODERS && len == 9) {
-    const int16_t* enc = reinterpret_cast<const int16_t*>(&data[1]);
-    Serial.printf("ENC   LF=%d  LB=%d  RF=%d  RB=%d\n",
-                  enc[0], enc[1], enc[2], enc[3]);
+  else if (type == MSG_TYPE_ENCODERS && len == sizeof(EncoderYawPacket)) {
+
+    auto *p = reinterpret_cast<const EncoderYawPacket *>(data);
+
+    Serial.printf("E,%d,%d,%d,%d,%.2f\n",
+                  p->counts[0],
+                  p->counts[1],
+                  -p->counts[2],
+                  -p->counts[3],
+                  p->yaw);   
   }
 }
