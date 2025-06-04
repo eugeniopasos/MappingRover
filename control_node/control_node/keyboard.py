@@ -33,7 +33,7 @@ class KeyboardPublisher(Node):
                 ch = sys.stdin.read(1)      # non-blocking thanks to raw mode
                 if not ch:
                     continue
-                if ch.lower() in ['w', 'a', 's', 'd', 'x', 'r', 'f', 'u', 
+                if ch.lower() in ['t','w', 'a', 's', 'd', 'x', 'r', 'f', 'u', 
                                   'i', 'o', 'j', 'k', 'l', 'n', ',']:
                     msg = String()
                     msg.data = ch.lower()
