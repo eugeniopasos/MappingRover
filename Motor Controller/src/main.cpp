@@ -81,6 +81,7 @@ HardwareSerial collector_serial(1);
 
 // === FUNCTION DECLARATIONS === 
 void setMotorSpeed(int motorID, int speed);
+void coastAllMotors();
 void brakeMotor(int motorID);
 void motorTest();
 void setupIMU();
@@ -90,7 +91,7 @@ int pid(float current_yaw, float goal_yaw);
 
 // === VARIABLES === 
 char cmd      = STOP;
-char prev_cmd = '.';
+char prev_cmd = STOP;
 int speed     = 45;
 
 float yaw, prev_yaw, target_yaw;
@@ -107,6 +108,7 @@ void setup() {
   digitalWrite(2, LOW);
 
   collector_serial.begin(460800, SERIAL_8N1, RXD1, TXD1); // UART to collector ESP32
+  collector_serial.setTimeout(10);
 
   // Initialize motor pins
   for (int i = 0; i < 4; i++) {
@@ -284,33 +286,43 @@ void loop() {
         speed -= 1;
         cmd = prev_cmd;
         break;
+
+      default:
+        break;
       
     }
   }
   // Autonomous Mode
   else {
+    switch (cmd) {
+      case STOP:
+        coastAllMotors();
+        delay(15);
+        brakeMotor(LF);
+        brakeMotor(RF);
+        brakeMotor(LB);
+        brakeMotor(RB); 
+        break;
 
-    if (cmd == STOP) {
-      brakeMotor(LF);
-      brakeMotor(RF);
-      brakeMotor(LB);
-      brakeMotor(RB); 
+      case BACKWARD:
+        setMotorSpeed(LF, -speed);
+        setMotorSpeed(RF, -speed);
+        setMotorSpeed(LB, -speed);
+        setMotorSpeed(RB, -speed);
+        break;
+        
+      
+      default:
+        correction = pid(yaw, target_yaw);
+
+        setMotorSpeed(LF, speed - correction);
+        setMotorSpeed(RF, speed + correction);
+        setMotorSpeed(LB, speed - correction);
+        setMotorSpeed(RB, speed + correction);
+        break;
+        
     }
-
-    else {
-      correction = pid(yaw, target_yaw);
-
-      setMotorSpeed(LF, speed - correction);
-      setMotorSpeed(RF, speed + correction);
-      setMotorSpeed(LB, speed - correction);
-      setMotorSpeed(RB, speed + correction);
-
-    }
-
-
-
   }
- 
 } // loop end
 
 
@@ -436,6 +448,16 @@ void setMotorSpeed(int motorID, int speed) {
   }
 
   ledcWrite(MOTOR_PWM_CH[index], pwm);
+}
+
+void coastAllMotors() {
+
+  for (int i = 0; i < 4; i++) {
+    ledcWrite(MOTOR_PWM_CH[i], 0);   // zero duty
+    digitalWrite(MOTOR_IN1[i], HIGH); // configuration floats the outputs
+    digitalWrite(MOTOR_IN2[i], HIGH); 
+
+  }
 }
 
 // === Brake a Specific Motor ===
