@@ -166,8 +166,6 @@ class ExplorerNode(Node):
             dy = centroid[0] - robot_row
             dx = centroid[1] - robot_col
             dist = np.linalg.norm([dy,dx])
-            # dist = np.linalg.norm([robot_row - centroid[0],
-            #                        robot_col - centroid[1]])
 
             # ignore clusters too close
             if dist < self.min_frontier_cell_distance or dist > self.max_frontier_cell_distance:

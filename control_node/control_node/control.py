@@ -27,11 +27,10 @@ CONST_WHEEL_DIAMETER  = 0.080 # 80 mm Mecanum wheels (m)
 CONST_BASELINE        = 0.205 # distance between left/right wheel centres (m)
 SCAN_SIZE             = 512   # points/rev
 
-FRONT_ANGLE_DEG = 60.0          # ± this half-angle
-STOP_RADIUS     = 0.25          # m
-CLEAR_RADIUS    = 0.30          # m  (must be > STOP_RADIUS)
+STOP_RADIUS           = 0.50          # m
+CLEAR_RADIUS          = 0.55          # m  (must be > STOP_RADIUS)
 
-PORT                  = '/dev/ttyUSB0'
+PORT                  = '/dev/ttyUSB0' # USB Device name
 BAUD                  = 921600
 # ENCODER COUNTS
 QUARTER_SPAN          = 2**14  # 16384
@@ -50,8 +49,6 @@ class SerialBridge(Node):
 
         self.create_timer(0.5, self.direction_sender)
 
-        #self.tf_timer = self.create_timer(0.05, self.publish_tf)  # 20 Hz
-
         self.create_subscription(String, 'key_cmd', self.cb_key, 1)
         self.create_subscription(PointStamped, '/lookahead_point', self.direction_finder ,10)
 
@@ -69,12 +66,12 @@ class SerialBridge(Node):
         self.prev_angle = 0.0
 
         self.stopped = False
+        self.reversing = False
 
         # --- Odometry state / Pose -------------------------------------
         self.x = self.y = self.yaw = self.yaw_prev = 0.0
         self.last_ticks = None
-        self.last_time  = time.time()
-        self.stag_counter = 0
+        self.last_time  = None
 
         self.r = 0.0
         self.theta = 0.0
@@ -108,30 +105,20 @@ class SerialBridge(Node):
 
     def cb_key(self, msg: String):
 
-        if self.autonomous == False:
-            try:
-                self.ser.write(bytes([0x12]))
-                self.ser.write(msg.data.encode('ascii', 'ignore'))
-                #self.get_logger().info('Sent on Serial: ' + str(msg.data))
-                #self.x_count = 0
-                #self.ser.flush()            # optional – forces immediate TX
-            except serial.SerialException as e:
-                self.get_logger().error(f'Serial command write error: {e}')
-            #self.last_rx = self.get_clock().now()
-        
         """Forward one ASCII byte to the serial port."""
         if str(msg.data) == 't':
             self.autonomous = not(self.autonomous)
             self.get_logger().info("Mode: Autonomous: " + str(self.autonomous))
 
-            # if self.autonomous:
-            #     self.get_logger().info("Mode: Autonomous: " + str(self.autonomous))
-            # else:
-            #     self.get_logger().info("Mode: Manuel Control: " + + str(self.autonomous))
-
-        
-        
-
+        try:
+            self.ser.write(bytes([0x12]))
+            self.ser.write(msg.data.encode('ascii', 'ignore'))
+            #self.get_logger().info('Sent on Serial: ' + str(msg.data))
+            #self.x_count = 0
+            #self.ser.flush()            # optional – forces immediate TX
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial command write error: {e}')
+            
     def direction_finder(self, msg: PointStamped):
 
         if self.autonomous == True:
@@ -141,12 +128,8 @@ class SerialBridge(Node):
             self.r = math.sqrt(x**2 + y**2)
 
             if self.r < 0.3:
-                try:
-                    stop = 'x'
-                    self.ser.write(bytes([0x12]))
-                    self.ser.write(stop.encode('ascii', 'ignore'))
-                except serial.SerialException as e:
-                    self.get_logger().error(f'Serial stop send error: {e}')
+                self.stop_avoid()
+                return
 
             self.theta = math.atan2(y,x) # returns radians
             self.deg = self.theta * 180 / math.pi
@@ -155,7 +138,7 @@ class SerialBridge(Node):
 
     def direction_sender(self):
 
-        if self.autonomous == True and self.r >= 0.3: # just above robot radius
+        if self.autonomous == True and self.r >= 0.3 and self.stopped == False: 
 
             data = struct.pack('<f', self.deg)
 
@@ -179,6 +162,15 @@ class SerialBridge(Node):
         except serial.SerialException as e:
             self.get_logger().error(f'Serial stop send error: {e}')
 
+    def reverse(self):
+
+        try:
+            msg = 's'
+            self.ser.write(bytes([0x12]))
+            self.ser.write(msg.encode('ascii', 'ignore'))
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial stop send error: {e}')
+
     # -----------------------------------------------------------
     #  LiDAR: collect points until angle wraps, then publish scan
     # -----------------------------------------------------------
@@ -197,14 +189,20 @@ class SerialBridge(Node):
         self.ranges[idx] = dist_mm / 1000.0      # → metres
         self.intens[idx] = quality                  # quality
 
-        front = (angle_deg >= 360 - FRONT_ANGLE_DEG) or (angle_deg <= FRONT_ANGLE_DEG)
-
-        if front and self.autonomous:
-            if self.ranges[idx]< STOP_RADIUS and not self.stopped:
+        if self.autonomous:
+            if self.ranges[0]< STOP_RADIUS and not(self.stopped) and not(self.reversing):
                 self.stop_avoid()
+                self.get_logger().info("Stopping!")
                 self.stopped = True
-            elif self.ranges[idx]> CLEAR_RADIUS and self.stopped:
+                
+            elif self.ranges[0]< CLEAR_RADIUS and self.stopped and not(self.reversing):
+                self.reverse()
+                self.get_logger().info("Reversing!")
+                self.reversing = True
+
+            elif self.ranges[0]> CLEAR_RADIUS and self.stopped and self.reversing:
                 self.stopped = False
+                self.reversing = False
 
 
         # angle went from high to low ⇒ full revolution finished
@@ -213,27 +211,23 @@ class SerialBridge(Node):
             # clear for next revolution
             self.intens  = [0.0] * SCAN_SIZE
             self.ranges  = [float('inf')] * SCAN_SIZE
-            self.intens  = [0.0] * SCAN_SIZE
 
         self.prev_angle = angle_deg
 
     def publish_scan(self):
-        now = self.get_clock().now()
-        msg = LaserScan()
-       # msg.header.stamp = self.last_time.to_msg()
-        msg.header.stamp = now.to_msg()
-        msg.header.frame_id = 'laser'
-        msg.angle_min    = 0.0
-        msg.angle_max    = 2*math.pi
-        msg.angle_increment = 2*math.pi / SCAN_SIZE
-        msg.time_increment  = 0.0
-        msg.scan_time       = 0.0
-        msg.range_min   = 0.01
-        msg.range_max   = 12.0
-        msg.ranges      = self.ranges
-        msg.intensities = self.intens
-        self.pub_scan.publish(msg)
-        #self.get_logger().info(str(msg))
+        scan = LaserScan()
+        scan.header.stamp = self.last_time.to_msg()
+        scan.header.frame_id = 'laser'
+        scan.angle_min    = 0.0
+        scan.angle_max    = 2*math.pi
+        scan.angle_increment = 2*math.pi / SCAN_SIZE
+        scan.scan_time       = 0.1
+        scan.time_increment  = scan.scan_time / SCAN_SIZE
+        scan.range_min   = 0.01
+        scan.range_max   = 12.0
+        scan.ranges      = self.ranges
+        scan.intensities = self.intens
+        self.pub_scan.publish(scan)
 
     # -----------------------------------------------------------
     #  Encoders: integrate differential odom, publish /odom & TF
@@ -249,7 +243,6 @@ class SerialBridge(Node):
             else:
                 self.yaw = -float(yaw) * math.pi / 180
 
-
             # self.get_logger().info('yaw: ' + str(yaw))
             # self.get_logger().info('lf: ' + str(lf) + ' lb: ' + str(lb) + 
             #                        ' rf: ' + str(rf) + ' rb: '+ str(rb))
@@ -264,7 +257,6 @@ class SerialBridge(Node):
         
         # --- Δ ticks and Δ time (ROS 2 clock) ----------------------
         raw_deltas = [c - p for c, p in zip(ticks, self.last_ticks)]
-        # self.get_logger().info('raw:' + str(raw_deltas))
         corrected = []
         for d in raw_deltas:
             if   d >  QUARTER_SPAN:
@@ -273,7 +265,6 @@ class SerialBridge(Node):
                 d += HALF_SPAN
             corrected.append(d)
         deltas = corrected
-        # self.get_logger().info('cor: ' + str(deltas))
             
         self.last_ticks = ticks
 
@@ -291,16 +282,14 @@ class SerialBridge(Node):
             distL = dL * math.pi * CONST_WHEEL_DIAMETER / CONST_TICKS_PER_REV
             distR = dR * math.pi * CONST_WHEEL_DIAMETER / CONST_TICKS_PER_REV
             d_center = 0.5 * (distL + distR)
-            #d_yaw    = (distR - distL) / CONST_BASELINE
 
         # --- pose ---------------------------------------
-        #self.yaw = yaw
         d_yaw = self.yaw - self.yaw_prev
         self.x   += d_center * math.cos(self.yaw)
         self.y   += d_center * math.sin(self.yaw)
         self.yaw_prev = self.yaw
-        #self.get_logger().info('delta yaw: '+ str(d_yaw))
-        # --- publish odom + TF with **one** timestamp -------------
+
+        # --- publish odom + TF -------------
         q = quaternion_from_yaw(self.yaw)
 
         odom = Odometry()
